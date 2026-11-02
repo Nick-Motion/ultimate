@@ -180,6 +180,14 @@ export default function messages(host: ExtensionHost) {
   host.implement(Branches, {
     starter: (id, ctx) => starterOf(host, id, ctx),
     working: (tx, id) => working(tx, id),
+    failed: async ({ branch, lander, text, wake, requestId }, ctx) => {
+      const ultimate = (await host.harness().snapshot(Standing, ROOT_CONVERSATION_ID, ctx))
+        ?.ultimate
+      if (ultimate === undefined || ultimate === branch) return
+      if (wake)
+        await send(host, lander, { to: `#${ultimate}`, text, reply: false }, ctx, { requestId })
+      else await host.need(LineageApi).leaveNote(ultimate, text, { from: lander, requestId })
+    },
   })
   host.implement(MessagesApi, {
     answer: (messageId, text, ctx, device) => answer(host, messageId, text, ctx, { device }),

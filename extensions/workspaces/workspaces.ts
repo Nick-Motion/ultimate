@@ -210,6 +210,7 @@ export function workspaces(host: Host) {
   const Lander = createLander(host, Workspaces, serial, {
     starter: async (id, context) => host.want(Branches)?.starter(id, context),
     working: async (tx, id) => (await host.want(Branches)?.working(tx, id)) ?? false,
+    failed: async (input, context) => host.want(Branches)?.failed(input, context),
     conclude: (tx, id) => host.need(ConversationsApi).concludeIn(tx, [id]),
     release: (id, context) => release([id], context),
   })

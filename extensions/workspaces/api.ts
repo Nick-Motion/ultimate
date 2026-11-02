@@ -38,6 +38,20 @@ export type BranchesService = {
   starter(id: ConversationId, ctx: Context): Promise<number | undefined>
   /** Inside `tx`: whether branch `id` has work of its own that will wake it again, so a landing leaves it open. */
   working(tx: Tx, id: ConversationId): Promise<boolean>
+  /**
+   * Tell @ultimate that branch `branch`'s submission failed, from lander conversation `lander`: a note, or with `wake` a
+   * one-way message that wakes it. Once per `requestId`; nothing when the branch is @ultimate itself.
+   */
+  failed(
+    input: {
+      branch: ConversationId
+      lander: number
+      text: string
+      wake: boolean
+      requestId: string
+    },
+    ctx: Context,
+  ): Promise<void>
 }
 /** What a landing asks about the branch it landed; messages provides it. `want` it. */
 export const Branches = defineApi<BranchesService>()('workspaces.branches')

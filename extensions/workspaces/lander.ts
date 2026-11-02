@@ -13,6 +13,7 @@ import { git } from '../../lib/git.ts'
 import { runGroup, sweepPidFiles } from '../../lib/process-group.ts'
 import type { ExtensionHost } from '../../server/extensions.ts'
 import { CheckRan, SubmissionLanded } from './api.ts'
+import type { BranchesService } from './api.ts'
 import { setup } from './setup.ts'
 import { addCheckout, treePath } from './tree.ts'
 import type { Landed, LanderEntry, LanderOutcome, QueueEntry, WorkspaceIndex } from './types.ts'
@@ -328,6 +329,7 @@ export function createLander(
     working: (tx: Tx, id: ConversationId) => Promise<boolean>
     conclude: (tx: Tx, id: ConversationId) => Promise<void>
     release: (id: ConversationId, context: Context) => Promise<unknown>
+    failed: BranchesService['failed']
   },
   limits: CheckLimits = checkLimits,
 ) {
@@ -653,7 +655,10 @@ export function createLander(
                 if (first === 'passed') return {}
                 // The rerun's outcome is durable either way: a resume while the group's other commands still run
                 // neither grants a third run nor loses the failure.
-                let rerun = await runtime.memo<{ failure?: string }>(`${key}:rerun`, context)
+                let rerun = await runtime.memo<{ failure?: string; timedOut?: boolean }>(
+                  `${key}:rerun`,
+                  context,
+                )
                 if (!rerun) {
                   await step(`rerunning: ${command}`)
                   const began = performance.now()
@@ -679,13 +684,17 @@ export function createLander(
                         ms: Math.round(timing.ms),
                       })
                     }, context)
-                  rerun = await runtime.memo<{ failure?: string }>(
+                  rerun = await runtime.memo<{ failure?: string; timedOut?: boolean }>(
                     `${key}:rerun`,
-                    ran.failure === undefined ? {} : { failure: ran.failure },
+                    ran.failure === undefined
+                      ? {}
+                      : { failure: ran.failure, ...(ran.timedOut ? { timedOut: true } : {}) },
                     context,
                   )
                 }
-                return rerun.failure === undefined ? { flaky: true } : { failure: rerun.failure }
+                return rerun.failure === undefined
+                  ? { flaky: true }
+                  : { failure: rerun.failure, timedOut: rerun.timedOut }
               }
               // Every command settles before a failure hands over, so none still runs in the checkout.
               const settled = await Promise.allSettled(commands.map(settle))
@@ -693,11 +702,20 @@ export function createLander(
                 if (outcome.status === 'rejected') throw outcome.reason
                 return outcome.value
               })
-              const failed = results.findIndex((result) => result.failure !== undefined)
-              if (failed !== -1)
+              // Every failed check of the group, each named as failed or timed out; the first one's output.
+              const failed = commands.flatMap((command, member) => {
+                const result = results[member]
+                return result.failure === undefined ? [] : [{ ...result, command }]
+              })
+              if (failed.length)
                 return await fail(
-                  `check failed twice: ${commands[failed]}`,
-                  results[failed].failure,
+                  failed
+                    .map(
+                      (check) =>
+                        `check ${check.timedOut ? 'timed out' : 'failed'} twice: ${check.command}`,
+                    )
+                    .join('; '),
+                  failed[0].failure,
                   'Fix it at its cause (a flaky test too: fix or delete it), verify and submit again.',
                 )
               flaky.push(...commands.filter((_command, member) => results[member].flaky))
@@ -793,6 +811,22 @@ export function createLander(
               entry,
               whenBusy: 'followUp',
               requestId: `lander:${id}`,
+            },
+            context,
+          )
+          // @ultimate hears of every failure as a note, and wakes on a branch's second failure in a row.
+          const { results } = (await runtime.snapshot(Workspaces, ROOT_CONVERSATION_ID, context))!
+          const previous = Object.entries(results).findLast(
+            ([key, result]) => key !== id && result.conversationId === conversationId,
+          )?.[1]
+          const again = previous?.outcome === 'failed'
+          await after.failed(
+            {
+              branch,
+              lander: runtime.conversationId,
+              text: `#${conversationId}'s submission ${id} failed${again ? ' again, twice in a row' : ''}: ${outcome.reason}. It is fixing it and will submit again.`,
+              wake: again,
+              requestId: `lander-alert:${id}`,
             },
             context,
           )

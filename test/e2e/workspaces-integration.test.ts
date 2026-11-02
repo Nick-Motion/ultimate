@@ -46,7 +46,7 @@ import { Messages, MessagesApi } from '../../extensions/messages/api.ts'
 import { Started } from '../../extensions/messages/addresses.ts'
 import promptExtension, { order as promptOrder } from '../../extensions/prompt/server.ts'
 import subagents from '../../extensions/subagents/server.ts'
-import { Subagents } from '../../extensions/subagents/api.ts'
+import { Standing, Subagents } from '../../extensions/subagents/api.ts'
 import { seedTally, temp, until } from '../helpers.ts'
 
 /** The part of the conversations service a test stands in for; standing a lander turns its summaries off and marks it standing. */
@@ -773,6 +773,7 @@ it.concurrent('emits one landed event and notes the root once, across a replayed
     working: async () => false,
     conclude: async () => {},
     release: async () => [],
+    failed: async () => {},
   })
   const report = task.definition.phases.report
   let replays = 0
@@ -1174,6 +1175,57 @@ it.concurrent('wakes only the submitter on a failed landing and leaves it open',
       (entry) => entry.kind === 'workspaces.lander-report',
     ),
   ).toHaveLength(0)
+})
+it.concurrent('notes @ultimate of each failed submission and wakes it on the second in a row', async () => {
+  const { f, id } = await concluding()
+  const ultimate = await f.opened.harness.commit(async (tx) => {
+    const created = await tx.createConversation({ ownership: { kind: 'ownerless' } })
+    ;(await tx.doc(Standing, ROOT_CONVERSATION_ID)).ultimate = created.id
+    // A reply the branch waits for keeps it open after it lands, so it can fail again.
+    const log = await tx.doc(Messages, ROOT_CONVERSATION_ID)
+    log.messages.push({
+      id: log.next++,
+      from: id,
+      to: ROOT_CONVERSATION_ID,
+      text: 'Review this?',
+      at: 1,
+      reply: true,
+      state: 'sent',
+    })
+    return created.id
+  }, context)
+  const alerts = async () => {
+    const view = await (await f.opened.harness.conversation(ultimate, context))!.context(context)
+    const messages = (await f.opened.harness.snapshot(Messages, ROOT_CONVERSATION_ID, context))!
+      .messages
+    return {
+      notes: view.entries.filter((entry) => entry.kind === 'lineage.note').length,
+      messages: messages.filter((message) => message.to === ultimate).map((m) => m.text),
+    }
+  }
+  const submit = async (check: string) => {
+    f.host.projectSettings = async () => ({ lander: { checks: [check] } })
+    await f.service.submit(id, 'None', context)
+    await submitted(f, id)
+  }
+  await submit('exit 1')
+  expect(await alerts()).toEqual({ notes: 1, messages: [] })
+  await submit('exit 1')
+  await until(async () => (await alerts()).messages.length === 1)
+  expect(await alerts()).toEqual({
+    notes: 1,
+    messages: [
+      expect.stringMatching(
+        new RegExp(
+          `^#${id}'s submission .* failed again, twice in a row: check failed twice: exit 1\\.`,
+        ),
+      ),
+    ],
+  })
+  await submit('true')
+  await commit((await f.service.get(id, context))!.path, 'next.txt')
+  await submit('exit 1')
+  expect(await alerts()).toMatchObject({ notes: 2, messages: { length: 1 } })
 })
 it.concurrent('delivers a message to a resumed branch whose checkout conclude released', async () => {
   const { f, id } = await concluding()
