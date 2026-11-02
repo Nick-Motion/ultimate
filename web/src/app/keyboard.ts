@@ -35,9 +35,11 @@ export function useShortcuts() {
           : [],
       )
       const typing = editable(event.target)
+      // A popup on the composer (`aria-expanded`, such as the `/` skill menu) owns its keys while open.
       const composer =
         event.target instanceof HTMLTextAreaElement &&
-        !!event.target.closest('[data-composer-target]')
+        !!event.target.closest('[data-composer-target]') &&
+        event.target.getAttribute('aria-expanded') !== 'true'
       const emptyPalette =
         store.getState().ui.paletteOpen &&
         event.target instanceof HTMLInputElement &&
