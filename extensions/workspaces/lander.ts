@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, mkdtempSync } from 'node:fs'
 import { mkdir, readdir, realpath, rm } from 'node:fs/promises'
+import { availableParallelism, loadavg } from 'node:os'
 import { join } from 'node:path'
 import { stripVTControlCharacters } from 'node:util'
 import { copyJson } from '@earendil-works/chord'
@@ -112,7 +113,16 @@ type Check = { command: string; timeout?: number }
 type Settings = {
   checks: (Check | Check[])[]
   push?: string
+  /** The 1-minute load average below which checks start; the CPU count when unset. */
+  quietLoad?: number
 }
+/** How often a held submission looks at the load again, and how long it waits for a quiet machine at most. */
+const quietPoll = 5000
+const quietCap = 15 * 60 * 1000
+const quietStep = 'waiting for a quiet machine'
+/** Whether a submission still holds its checks: the machine is busy and it has waited less than the cap. */
+export const holdForLoad = (load: number, threshold: number, since: number, now: number) =>
+  load >= threshold && now - since < quietCap
 /** Bounded retries when the target moves while a submission is integrated. */
 const attempts = 3
 /** Seconds without output and total seconds allowed for one check, unless the check sets its own `timeout`. */
@@ -241,7 +251,7 @@ const parseCheck = (value: unknown): Check | undefined => {
 }
 export const landerSettings = async (host: Pick<Host, 'projectSettings'>): Promise<Settings> => {
   const lander = (await host.projectSettings()).lander as
-    | { checks?: unknown; push?: unknown }
+    | { checks?: unknown; push?: unknown; quietLoad?: unknown }
     | undefined
   const entries = lander?.checks ?? []
   const checks = Array.isArray(entries)
@@ -259,9 +269,13 @@ export const landerSettings = async (host: Pick<Host, 'projectSettings'>): Promi
     )
   if (lander?.push !== undefined && typeof lander.push !== 'string')
     throw new Error('lander.push must be a remote name')
+  const { quietLoad } = lander ?? {}
+  if (quietLoad !== undefined && !(typeof quietLoad === 'number' && quietLoad > 0))
+    throw new Error('lander.quietLoad must be a positive load average')
   return {
     checks: checks as Settings['checks'],
     ...(lander?.push ? { push: lander.push } : {}),
+    ...(quietLoad !== undefined ? { quietLoad } : {}),
   }
 }
 export const contains = (cwd: string, ancestor: string, descendant: string) =>
@@ -295,6 +309,8 @@ const landedOutcome = (landed: Landed): LanderOutcome => ({
 })
 type State =
   | { phase: 'next' }
+  /** Checks wait for a quiet machine, since `since`, at most `quietCap`. */
+  | { phase: 'quiet'; id: string; since: number }
   /** A rejected push integrates again once. */
   | { phase: 'land'; id: string; attempt: number; pushRetried?: boolean }
   | {
@@ -355,8 +371,43 @@ export function createLander(
           }
           entry.state = 'landing'
           await log(tx, runtime.conversationId, entry, { step: 'started' })
-          return { status: 'running', checkpoint: { phase: 'land', id: entry.id, attempt: 1 } }
+          return {
+            status: 'running',
+            checkpoint: { phase: 'quiet', id: entry.id, since: runtime.now() },
+          }
         }, context),
+      quiet: async (task, runtime, context) => {
+        const { id, since } = task.state.checkpoint
+        const threshold =
+          (await landerSettings(host).then(
+            (settings) => settings.quietLoad,
+            // Invalid settings fail the submission in the land phase, which reports them.
+            () => undefined,
+          )) ?? availableParallelism()
+        const load = loadavg()[0]
+        const now = runtime.now()
+        const hold = holdForLoad(load, threshold, since, now)
+        await runtime.commit(async (tx) => {
+          const saved = (await tx.doc(Workspaces, ROOT_CONVERSATION_ID)).queue.find(
+            (item) => item.id === id,
+          )!
+          const loadText = `load ${load.toFixed(1)}, below ${threshold} needed`
+          const last = saved.steps.at(-1)
+          if (hold) {
+            const text = `${quietStep} (${loadText})`
+            saved.step = text
+            // One log line per wait; the submission's step row follows the current load.
+            if (last?.step.startsWith(quietStep)) last.step = text
+            else await log(tx, runtime.conversationId, saved, { step: text })
+            return { status: 'sleeping', until: now + quietPoll, checkpoint: task.state.checkpoint }
+          }
+          if (load >= threshold)
+            await log(tx, runtime.conversationId, saved, {
+              step: `checking anyway after ${seconds(quietCap / 1000)} (${loadText})`,
+            })
+          return { status: 'running', checkpoint: { phase: 'land', id, attempt: 1 } }
+        }, context)
+      },
       land: async (task, runtime, context) => {
         const { id, attempt, pushRetried } = task.state.checkpoint
         const { signal } = runtime

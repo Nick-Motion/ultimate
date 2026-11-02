@@ -153,6 +153,9 @@ first lines and outcome, and the root note carry that snapshot. `landing.tsx` re
 the root's landing note; its one-line `Subject` heads each submission in the lander log and the submit card, and the
 lander's sidebar row shows the feature it lands or landed last.
 
+0. Waits for a quiet machine: while the 1-minute load average is at or above `lander.quietLoad` (default: the CPU
+   count), the task sleeps durably and looks again every 5 seconds, its step row showing
+   "waiting for a quiet machine" with the current load. After 15 minutes it runs the checks anyway, logging the load.
 1. Resets its own detached checkout, `<home>/lander/<hash of source>`, to the target branch tip. `isolates.worktree.setup`
    runs once when the checkout is created. With `lander.push`, it fetches the remote branch and merges it when it is ahead.
 2. Merges the submitted tip. A conflict aborts the merge and reports the conflicting paths to the submitter.

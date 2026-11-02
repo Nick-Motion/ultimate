@@ -6,6 +6,7 @@ import { afterEach, expect, it, vi } from 'vitest'
 import { context } from '../server/harness.ts'
 import { runGroup } from '../lib/process-group.ts'
 import {
+  holdForLoad,
   landerSettings,
   limitsFor,
   runLanderCheck as run,
@@ -140,6 +141,13 @@ it('reads plain commands and commands with their own timeout from settings', asy
     'pnpm test',
   ])
     await expect(settings(invalid)).rejects.toThrow('lander.checks must be')
+})
+
+it('holds checks while the machine is busy, at most 15 minutes', () => {
+  const minute = 60 * 1000
+  expect(holdForLoad(20, 8, 0, minute)).toBe(true)
+  expect(holdForLoad(7.9, 8, 0, minute)).toBe(false)
+  expect(holdForLoad(20, 8, 0, 15 * minute)).toBe(false)
 })
 
 it('preserves task cancellation instead of reporting a watchdog failure', async () => {
