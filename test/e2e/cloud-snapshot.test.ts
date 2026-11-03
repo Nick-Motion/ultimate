@@ -96,8 +96,11 @@ beforeAll(async () => {
   writer = new DatabaseSync(database)
   writer.exec(`PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;
     CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT); CREATE TABLE blobs (data BLOB);`)
+  // One transaction: 500 commits fsync 500 times, which took over 10 s on a loaded btrfs lander.
   const note = writer.prepare('INSERT INTO notes (body) VALUES (?)')
+  writer.exec('BEGIN')
   for (let i = 0; i < 500; i++) note.run(`note ${i}`)
+  writer.exec('COMMIT')
   writer.prepare('INSERT INTO blobs VALUES (?)').run(randomBytes(1.1 * 1024 * 1024))
   progress = []
   manifest = await uploadSnapshot({
