@@ -1,7 +1,7 @@
 import { mkdtempSync, realpathSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterAll } from 'vitest'
+import { afterAll, vi } from 'vitest'
 import { testTempPrefix } from './sweep-temp.ts'
 
 // macOS's TMPDIR is a symlink (/var -> /private/var); git and the server report the resolved path.
@@ -20,6 +20,12 @@ process.env.TAILSCALE_COMMAND = join(testTmpdir, 'no-tailscale')
 // Instance startup sweeps must never inspect the machine's real preview homes during tests.
 const previousTmpdir = process.env.TMPDIR
 process.env.TMPDIR = testTmpdir
+
+// The lander holds checks while the machine is busy; tests that land must not wait on this machine's real load.
+vi.mock('node:os', async (original) => ({
+  ...(await original<typeof import('node:os')>()),
+  loadavg: () => [0, 0, 0],
+}))
 
 afterAll(() => {
   if (previousTmpdir === undefined) delete process.env.TMPDIR

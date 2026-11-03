@@ -4,6 +4,23 @@ import { expect, it } from 'vitest'
 import { runLanderCheck } from '../../extensions/workspaces/lander.ts'
 import { context } from '../../server/harness.ts'
 import { removeTemp, temp } from '../helpers.ts'
+import { running } from './process-helpers.ts'
+
+// A test's detached server left writing to the check's TMPDIR made the temp removal throw ENOTEMPTY.
+it('stops a detached child still writing to its temp folder, then removes the folder', async () => {
+  const directory = await temp('ultimate-lander-detached-')
+  try {
+    const childFile = join(directory, 'child')
+    const tmp = join(directory, 'tmp')
+    const command = `setsid sh -c 'mkdir -p "$TMPDIR/state"; while true; do touch "$TMPDIR/state/$(date +%s%N)"; sleep 0.01; done' & echo $! > '${childFile}'; sleep 0.2`
+    const result = await runLanderCheck(directory, command, context, join(directory, 'pids'), tmp)
+    expect(result.failure).toBeUndefined()
+    expect(await readdir(tmp)).toEqual([])
+    expect(running(Number(await readFile(childFile, 'utf8')))).toBe(false)
+  } finally {
+    await removeTemp(directory)
+  }
+})
 
 it('kills a silent process group on stall and a printing process on the total cap', async () => {
   const directory = await temp('ultimate-lander-watchdog-')

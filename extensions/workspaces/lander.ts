@@ -1,7 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, mkdtempSync } from 'node:fs'
-import { mkdir, readdir, realpath, rm } from 'node:fs/promises'
+import { mkdir, readdir, readFile, realpath, rm } from 'node:fs/promises'
+import { availableParallelism, loadavg } from 'node:os'
 import { join } from 'node:path'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { stripVTControlCharacters } from 'node:util'
 import { copyJson } from '@earendil-works/chord'
 import type { Context } from '@earendil-works/chord'
@@ -10,7 +12,7 @@ import { withAbortSignal } from '@earendil-works/chord/context'
 import { defineEntry, defineTask, ROOT_CONVERSATION_ID } from '@earendil-works/pi-durable'
 import type { ConversationDocToken, ConversationId, Tx } from '@earendil-works/pi-durable'
 import { git } from '../../lib/git.ts'
-import { runGroup, sweepPidFiles } from '../../lib/process-group.ts'
+import { identify, runGroup, sweepPidFiles } from '../../lib/process-group.ts'
 import type { ExtensionHost } from '../../server/extensions.ts'
 import { CheckRan, SubmissionLanded } from './api.ts'
 import type { BranchesService } from './api.ts'
@@ -113,7 +115,16 @@ type Check = { command: string; timeout?: number }
 type Settings = {
   checks: (Check | Check[])[]
   push?: string
+  /** The 1-minute load average below which checks start; the CPU count when unset. */
+  quietLoad?: number
 }
+/** How often a held submission looks at the load again, and how long it waits for a quiet machine at most. */
+const quietPoll = 5000
+const quietCap = 15 * 60 * 1000
+const quietStep = 'waiting for a quiet machine'
+/** Whether a submission still holds its checks: the machine is busy and it has waited less than the cap. */
+export const holdForLoad = (load: number, threshold: number, since: number, now: number) =>
+  load >= threshold && now - since < quietCap
 /** Bounded retries when the target moves while a submission is integrated. */
 const attempts = 3
 /** Seconds without output and total seconds allowed for one check, unless the check sets its own `timeout`. */
@@ -151,6 +162,57 @@ export const sweepChecks = async (home: string) => {
  * that test suites fill (EDQUOT) when interrupted runs leave their directories behind.
  */
 export const checkTemp = (home: string) => join(home, 'lander-tmp')
+
+/**
+ * Processes started with `tmp` as their TMPDIR, or a folder in it: what a check left running, also outside its process
+ * group (a detached server a test started). Linux only, from `/proc`; each with its start time, so a recycled pid is
+ * never signalled.
+ */
+async function strays(tmp: string) {
+  if (process.platform !== 'linux') return []
+  const found: { pid: number; start: string }[] = []
+  for (const name of await readdir('/proc')) {
+    const pid = Number(name)
+    if (!Number.isSafeInteger(pid) || pid === process.pid) continue
+    const environ = await readFile(`/proc/${pid}/environ`, 'utf8').catch(
+      // Gone meanwhile, or another user's process, which no check of ours started.
+      () => '',
+    )
+    const start = identify(pid)
+    if (
+      start &&
+      environ.split('\0').some((v) => v === `TMPDIR=${tmp}` || v.startsWith(`TMPDIR=${tmp}/`))
+    )
+      found.push({ pid, start })
+  }
+  return found
+}
+/** Stop what a check left running in `tmp` (TERM, KILL after a grace), then remove `tmp`; the failure, if any. */
+async function cleanCheck(tmp: string) {
+  try {
+    for (const signal of ['SIGTERM', 'SIGKILL'] as const) {
+      const left = await strays(tmp)
+      if (!left.length) break
+      for (const { pid, start } of left)
+        if (identify(pid) === start)
+          try {
+            process.kill(pid, signal)
+          } catch (error) {
+            // It exited between the check and the signal.
+            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+          }
+      const deadline = Date.now() + 2000
+      while (Date.now() < deadline && (await strays(tmp)).length) await sleep(50)
+    }
+    const survivors = await strays(tmp)
+    if (survivors.length)
+      return `Processes ${survivors.map(({ pid }) => pid).join(', ')} the check left in ${tmp} did not exit`
+    await rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    return undefined
+  } catch (error) {
+    return `Cleaning up ${tmp} failed: ${String(error)}`
+  }
+}
 
 /**
  * Run `command` with bash in its own process group, recorded in `pids` while it runs, with `TMPDIR` set to a fresh
@@ -204,7 +266,7 @@ export async function runLanderCheck(
     clearTimeout(stallTimer)
     stallTimer = setTimeout(stalled, limits.stall * 1000)
   }
-  try {
+  const run = async () => {
     let exitCode: number
     try {
       exitCode = await runGroup('/bin/bash', ['-c', command], {
@@ -224,11 +286,18 @@ export async function runLanderCheck(
     if (exitCode !== 0) return { failure: report(`exit ${exitCode}`, 'Failed tests:') }
     const last = lines(stripVTControlCharacters(output)).findLast((line) => line.trim())
     return { summary: last?.trim().slice(0, 200) }
+  }
+  let ran: Awaited<ReturnType<typeof run>>
+  let cleanup: string | undefined
+  try {
+    ran = await run()
   } finally {
     clearTimeout(stallTimer)
     clearTimeout(totalTimer)
-    await rm(tmp, { recursive: true, force: true })
+    cleanup = await cleanCheck(tmp)
   }
+  // What the check left behind fails it, as a check failure that reruns, never as a lander error.
+  return cleanup ? { ...ran, failure: [ran.failure, cleanup].filter(Boolean).join('\n') } : ran
 }
 
 /** A check from settings: a command, or `{ command, timeout }` with a positive timeout in seconds. */
@@ -242,7 +311,7 @@ const parseCheck = (value: unknown): Check | undefined => {
 }
 export const landerSettings = async (host: Pick<Host, 'projectSettings'>): Promise<Settings> => {
   const lander = (await host.projectSettings()).lander as
-    | { checks?: unknown; push?: unknown }
+    | { checks?: unknown; push?: unknown; quietLoad?: unknown }
     | undefined
   const entries = lander?.checks ?? []
   const checks = Array.isArray(entries)
@@ -260,9 +329,14 @@ export const landerSettings = async (host: Pick<Host, 'projectSettings'>): Promi
     )
   if (lander?.push !== undefined && typeof lander.push !== 'string')
     throw new Error('lander.push must be a remote name')
+  const { quietLoad } = lander ?? {}
+  if (quietLoad !== undefined && !(typeof quietLoad === 'number' && quietLoad > 0))
+    throw new Error('lander.quietLoad must be a positive load average')
   return {
     checks: checks as Settings['checks'],
-    ...(lander?.push ? { push: lander.push } : {}),
+    // A preview never pushes; its git hooks refuse it too (extensions/instance).
+    ...(lander?.push && !process.env.ULTIMATE_PREVIEW_BRANCH ? { push: lander.push } : {}),
+    ...(quietLoad !== undefined ? { quietLoad } : {}),
   }
 }
 export const contains = (cwd: string, ancestor: string, descendant: string) =>
@@ -296,6 +370,8 @@ const landedOutcome = (landed: Landed): LanderOutcome => ({
 })
 type State =
   | { phase: 'next' }
+  /** Checks wait for a quiet machine, since `since`, at most `quietCap`. */
+  | { phase: 'quiet'; id: string; since: number }
   /** A rejected push integrates again once. */
   | { phase: 'land'; id: string; attempt: number; pushRetried?: boolean }
   | {
@@ -357,8 +433,43 @@ export function createLander(
           }
           entry.state = 'landing'
           await log(tx, runtime.conversationId, entry, { step: 'started' })
-          return { status: 'running', checkpoint: { phase: 'land', id: entry.id, attempt: 1 } }
+          return {
+            status: 'running',
+            checkpoint: { phase: 'quiet', id: entry.id, since: runtime.now() },
+          }
         }, context),
+      quiet: async (task, runtime, context) => {
+        const { id, since } = task.state.checkpoint
+        const threshold =
+          (await landerSettings(host).then(
+            (settings) => settings.quietLoad,
+            // Invalid settings fail the submission in the land phase, which reports them.
+            () => undefined,
+          )) ?? availableParallelism()
+        const load = loadavg()[0]
+        const now = runtime.now()
+        const hold = holdForLoad(load, threshold, since, now)
+        await runtime.commit(async (tx) => {
+          const saved = (await tx.doc(Workspaces, ROOT_CONVERSATION_ID)).queue.find(
+            (item) => item.id === id,
+          )!
+          const loadText = `load ${load.toFixed(1)}, below ${threshold} needed`
+          const last = saved.steps.at(-1)
+          if (hold) {
+            const text = `${quietStep} (${loadText})`
+            saved.step = text
+            // One log line per wait; the submission's step row follows the current load.
+            if (last?.step.startsWith(quietStep)) last.step = text
+            else await log(tx, runtime.conversationId, saved, { step: text })
+            return { status: 'sleeping', until: now + quietPoll, checkpoint: task.state.checkpoint }
+          }
+          if (load >= threshold)
+            await log(tx, runtime.conversationId, saved, {
+              step: `checking anyway after ${seconds(quietCap / 1000)} (${loadText})`,
+            })
+          return { status: 'running', checkpoint: { phase: 'land', id, attempt: 1 } }
+        }, context)
+      },
       land: async (task, runtime, context) => {
         const { id, attempt, pushRetried } = task.state.checkpoint
         const { signal } = runtime
