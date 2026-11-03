@@ -52,8 +52,12 @@ it('respects typing, dialogs, sequences, timeout, composition and listener teard
   class Textarea extends Element {
     override tagName = 'TEXTAREA'
     composer = false
+    expanded = false
     closest(selector: string) {
       return selector === '[data-composer-target]' && this.composer ? {} : null
+    }
+    getAttribute(name: string) {
+      return name === 'aria-expanded' && this.expanded ? 'true' : null
     }
   }
   const window = new EventTarget()
@@ -117,6 +121,11 @@ it('respects typing, dialogs, sequences, timeout, composition and listener teard
   side.scope = 17
   expect(send('Escape', side)).toBe(true)
   expect(runCommand).toHaveBeenLastCalledWith('stop', { conversationId: 17 })
+  // A popup open on the composer (the `/` skill menu) keeps Escape to close itself, not stop the run.
+  side.expanded = true
+  const stops = runCommand.mock.calls.length
+  expect(send('Escape', side)).toBe(false)
+  expect(runCommand).toHaveBeenCalledTimes(stops)
   const sideButton = new Element()
   sideButton.scope = 17
   expect(send('Escape', sideButton)).toBe(true)

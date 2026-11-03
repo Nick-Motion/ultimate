@@ -55,6 +55,7 @@
     "extensions/tasks/kinds.ts",
     "extensions/sidebar/listed.ts",
     "extensions/side-chat/logic.ts",
+    "extensions/info/slash.ts",
     "extensions/voice-live/relay.ts",
     "extensions/voice-live/session.ts",
     "extensions/system/feed.ts",
