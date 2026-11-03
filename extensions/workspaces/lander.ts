@@ -1,8 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { mkdirSync, mkdtempSync } from 'node:fs'
-import { mkdir, readdir, realpath, rm } from 'node:fs/promises'
+import { mkdir, readdir, readFile, realpath, rm } from 'node:fs/promises'
 import { availableParallelism, loadavg } from 'node:os'
 import { join } from 'node:path'
+import { setTimeout as sleep } from 'node:timers/promises'
 import { stripVTControlCharacters } from 'node:util'
 import { copyJson } from '@earendil-works/chord'
 import type { Context } from '@earendil-works/chord'
@@ -11,7 +12,7 @@ import { withAbortSignal } from '@earendil-works/chord/context'
 import { defineEntry, defineTask, ROOT_CONVERSATION_ID } from '@earendil-works/pi-durable'
 import type { ConversationDocToken, ConversationId, Tx } from '@earendil-works/pi-durable'
 import { git } from '../../lib/git.ts'
-import { runGroup, sweepPidFiles } from '../../lib/process-group.ts'
+import { identify, runGroup, sweepPidFiles } from '../../lib/process-group.ts'
 import type { ExtensionHost } from '../../server/extensions.ts'
 import { CheckRan, SubmissionLanded } from './api.ts'
 import { setup } from './setup.ts'
@@ -162,6 +163,57 @@ export const sweepChecks = async (home: string) => {
 export const checkTemp = (home: string) => join(home, 'lander-tmp')
 
 /**
+ * Processes started with `tmp` as their TMPDIR, or a folder in it: what a check left running, also outside its process
+ * group (a detached server a test started). Linux only, from `/proc`; each with its start time, so a recycled pid is
+ * never signalled.
+ */
+async function strays(tmp: string) {
+  if (process.platform !== 'linux') return []
+  const found: { pid: number; start: string }[] = []
+  for (const name of await readdir('/proc')) {
+    const pid = Number(name)
+    if (!Number.isSafeInteger(pid) || pid === process.pid) continue
+    const environ = await readFile(`/proc/${pid}/environ`, 'utf8').catch(
+      // Gone meanwhile, or another user's process, which no check of ours started.
+      () => '',
+    )
+    const start = identify(pid)
+    if (
+      start &&
+      environ.split('\0').some((v) => v === `TMPDIR=${tmp}` || v.startsWith(`TMPDIR=${tmp}/`))
+    )
+      found.push({ pid, start })
+  }
+  return found
+}
+/** Stop what a check left running in `tmp` (TERM, KILL after a grace), then remove `tmp`; the failure, if any. */
+async function cleanCheck(tmp: string) {
+  try {
+    for (const signal of ['SIGTERM', 'SIGKILL'] as const) {
+      const left = await strays(tmp)
+      if (!left.length) break
+      for (const { pid, start } of left)
+        if (identify(pid) === start)
+          try {
+            process.kill(pid, signal)
+          } catch (error) {
+            // It exited between the check and the signal.
+            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error
+          }
+      const deadline = Date.now() + 2000
+      while (Date.now() < deadline && (await strays(tmp)).length) await sleep(50)
+    }
+    const survivors = await strays(tmp)
+    if (survivors.length)
+      return `Processes ${survivors.map(({ pid }) => pid).join(', ')} the check left in ${tmp} did not exit`
+    await rm(tmp, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+    return undefined
+  } catch (error) {
+    return `Cleaning up ${tmp} failed: ${String(error)}`
+  }
+}
+
+/**
  * Run `command` with bash in its own process group, recorded in `pids` while it runs, with `TMPDIR` set to a fresh
  * directory in `temp` that is removed when it ends. The watchdog and task cancellation both stop the whole group:
  * TERM, then KILL after a short grace.
@@ -213,7 +265,7 @@ export async function runLanderCheck(
     clearTimeout(stallTimer)
     stallTimer = setTimeout(stalled, limits.stall * 1000)
   }
-  try {
+  const run = async () => {
     let exitCode: number
     try {
       exitCode = await runGroup('/bin/bash', ['-c', command], {
@@ -233,11 +285,18 @@ export async function runLanderCheck(
     if (exitCode !== 0) return { failure: report(`exit ${exitCode}`, 'Failed tests:') }
     const last = lines(stripVTControlCharacters(output)).findLast((line) => line.trim())
     return { summary: last?.trim().slice(0, 200) }
+  }
+  let ran: Awaited<ReturnType<typeof run>>
+  let cleanup: string | undefined
+  try {
+    ran = await run()
   } finally {
     clearTimeout(stallTimer)
     clearTimeout(totalTimer)
-    await rm(tmp, { recursive: true, force: true })
+    cleanup = await cleanCheck(tmp)
   }
+  // What the check left behind fails it, as a check failure that reruns, never as a lander error.
+  return cleanup ? { ...ran, failure: [ran.failure, cleanup].filter(Boolean).join('\n') } : ran
 }
 
 /** A check from settings: a command, or `{ command, timeout }` with a positive timeout in seconds. */

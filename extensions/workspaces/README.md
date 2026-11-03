@@ -163,6 +163,9 @@ lander's sidebar row shows the feature it lands or landed last.
    its own `timeout` (seconds, which also caps the no-output limit), killing its whole process group. Watchdog
    failures name the limit that fired, the failed test lines seen so far (vitest's `FAIL`/`×` lines, kept even when
    they scrolled out of the tail) and the output tail, and rerun like other check failures.
+   When a check ends, processes it left running with its `TMPDIR` (a detached server a test started outside the
+   check's process group) are stopped, TERM then KILL, before its temporary folder is removed; on Linux they are
+   found in `/proc`. A survivor or a failed removal fails the check with that reason, never the submission.
    An entry is a check or an array of checks, a group that runs concurrently; a check is a command string or
    `{ "command": "pnpm test", "timeout": 180 }`.
    A failing check
