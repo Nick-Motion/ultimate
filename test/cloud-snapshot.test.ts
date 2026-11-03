@@ -91,14 +91,14 @@ beforeAll(async () => {
     before[ref] = await tip(target, ref)
 
   // An open writer with uncheckpointed WAL frames: the copy must still be consistent and complete. The random
-  // blob compresses to more than one 16 MiB chunk.
+  // blob compresses to more than one 1 MiB chunk (the test's chunk size; production uses 16 MiB).
   database = join(await temp('ultimate-snapshot-home-'), 'state.sqlite')
   writer = new DatabaseSync(database)
   writer.exec(`PRAGMA journal_mode = WAL; PRAGMA wal_autocheckpoint = 0;
     CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT); CREATE TABLE blobs (data BLOB);`)
   const note = writer.prepare('INSERT INTO notes (body) VALUES (?)')
   for (let i = 0; i < 500; i++) note.run(`note ${i}`)
-  writer.prepare('INSERT INTO blobs VALUES (?)').run(randomBytes(17 * 1024 * 1024))
+  writer.prepare('INSERT INTO blobs VALUES (?)').run(randomBytes(1.1 * 1024 * 1024))
   progress = []
   manifest = await uploadSnapshot({
     ...remote,
@@ -106,6 +106,7 @@ beforeAll(async () => {
     database,
     repo: source,
     progress: (done, total, uploaded) => progress.push([done, total, uploaded]),
+    chunk: 1024 * 1024,
   })
 })
 afterAll(() => {

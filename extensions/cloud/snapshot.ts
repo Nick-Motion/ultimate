@@ -68,6 +68,8 @@ export async function uploadSnapshot(o: {
   root?: string
   signal?: AbortSignal
   progress?: (done: number, total: number, uploaded: number) => void
+  /** Compressed bytes per chunk; tests set a small one to cover several chunks with a small file. */
+  chunk?: number
 }): Promise<SnapshotManifest> {
   const id = `${Date.now().toString(36)}-${randomBytes(8).toString('hex')}`
   const temp = await mkdtemp(join(dirname(o.database), '.snapshot-'))
@@ -83,7 +85,8 @@ export async function uploadSnapshot(o: {
     const total = sizes[0] + sizes[1]
     const report = (read: number, sent: number) => (done: number, uploaded: number) =>
       o.progress?.(read + done, total, sent + uploaded)
-    const db = await seal(o, id, 'db', copy, report(0, 0))
+    const chunk = o.chunk ?? CHUNK
+    const db = await seal(o, id, 'db', copy, chunk, report(0, 0))
     const manifest: SnapshotManifest = {
       id,
       key: o.key,
@@ -92,7 +95,7 @@ export async function uploadSnapshot(o: {
       ...(o.root ? { root: o.root } : {}),
       database: db,
       bundle: bundle
-        ? await seal(o, id, 'bundle', bundle, report(sizes[0], db.uploaded!))
+        ? await seal(o, id, 'bundle', bundle, chunk, report(sizes[0], db.uploaded!))
         : undefined,
     }
     // The manifest goes last: it makes the snapshot complete and starts the Worker's retention.
@@ -195,6 +198,7 @@ async function seal(
   id: string,
   kind: Kind,
   file: string,
+  chunk: number,
   progress: (done: number, uploaded: number) => void,
 ): Promise<Part> {
   const hash = createHash('sha256')
@@ -226,12 +230,12 @@ async function seal(
       for await (const piece of source) {
         pieces.push(piece)
         size += piece.length
-        while (size >= CHUNK) {
+        while (size >= chunk) {
           const all = Buffer.concat(pieces)
           if (held) await upload(held, false)
-          held = all.subarray(0, CHUNK)
-          pieces = [all.subarray(CHUNK)]
-          size -= CHUNK
+          held = all.subarray(0, chunk)
+          pieces = [all.subarray(chunk)]
+          size -= chunk
         }
       }
       const rest = Buffer.concat(pieces)
