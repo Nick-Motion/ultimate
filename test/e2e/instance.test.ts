@@ -377,7 +377,8 @@ it('lands a preview submission on its own branch, never the previewed branch or 
       settings,
       JSON.stringify({
         ...JSON.parse(await readFile(settings, 'utf8')),
-        lander: { push: 'origin' },
+        // The preview is its own process, outside test/setup.ts's idle load: it must not wait for a quiet machine.
+        lander: { push: 'origin', quietLoad: 10_000 },
       }),
     )
     await git(f.source, 'commit', '-qam', 'Push landings')
